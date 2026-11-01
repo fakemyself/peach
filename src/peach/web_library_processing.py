@@ -15,7 +15,8 @@ ACTIVE = ('running', 'pausing', 'paused', 'stopping')
 #: `asset_ids`、`completed_metadata` 等大字段，页面一个都不读；照发的话每页每 10 秒轮询一次
 #: 就是两兆多，还把媒体路径交给了浏览器。续跑与重试读的是 `_current()`，不经过这里。
 PUBLIC_FIELDS = frozenset({
-    'run_id', 'metadata_only', 'status', 'outcome', 'speed_mode', 'eta_seconds_min', 'eta_seconds_max', 'eta_kind',
+    'run_id', 'metadata_only', 'status', 'outcome', 'speed_mode', 'collection_concurrency',
+    'eta_seconds_min', 'eta_seconds_max', 'eta_kind',
     'eta_scope', 'eta_initial', 'job_id', 'stage', 'requested_stage', 'steps', 'checked', 'total',
     'scanned', 'scanned_bytes', 'identified', 'candidates', 'auto_applied', 'covers', 'previews',
     'performer_aliases', 'performer_avatars', 'performer_profile_conflicts',
@@ -23,6 +24,7 @@ PUBLIC_FIELDS = frozenset({
     'issues_log', 'issues_truncated', 'retryable_asset_ids', 'notes', 'current_asset_id',
     'current_asset_name', 'current_action', 'current_started_at', 'last_progress_at', 'stalled',
     'waited_seconds', 'completed_at', 'current_source', 'skip_requested', 'archived', 'new_asset_count',
+    'collection_log', 'collection_preview',
 })
 
 

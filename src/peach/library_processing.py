@@ -35,6 +35,7 @@ from .genre_decisions import load_genre_decisions
 from .metadata import (candidate_text_is_valid, source_text_is_valid,
                        extract_catalog_evidence, extract_peach_fields, validate_provider_code)
 from . import metadata_routes
+from . import collection_log
 from . import media_identity
 from . import junk
 from . import sample_followup
@@ -267,9 +268,8 @@ COLLECTED_FIELDS = ('title', 'performers', 'studio', 'release_date', 'tags')
 COLUMN_OF = {'title': 'catalog_title'}
 
 #: 一趟任务向外部来源要的总量。三条闸门里谁先到谁生效，之后每部片只记「本趟…已用完」。
-#: 一部片问三家目录站、每家 1～2 次，所以 6000 次约等于 1500 部。请求是一条接一条发的，
-#: 同一主机两问之间隔着主机间隔（默认 2 秒，javdb 3 秒，见 `SOURCE_INTERVALS`），不同主机的间隔
-#: 互不阻塞；6000 次按 2 秒算也要三个多小时，和 4 小时的时间闸门同一量级，哪条先到都说得通。
+#: 一部片问三家目录站、每家 1～2 次，所以 6000 次约等于 1500 部。并发工作线程共用一份预算，
+#: 同一主机两问之间仍隔着主机间隔（默认 2 秒，javdb 3 秒，见 `SOURCE_INTERVALS`），不同主机的等待互不阻塞。
 #: 封面与资料页合计每次约 250 KB，1 GiB 装得下这 6000 次。
 MAX_SOURCE_REQUESTS = 6000
 MAX_SOURCE_BYTES = 1024 * 1024 * 1024
@@ -331,14 +331,14 @@ class LibraryMetadataProvider:
     `CredentialStore` 自己会拼上那一层。多给一层的表现不是报错，是每个来源都读成
     「没有凭据」——采集设置里贴好的 JavBus、javdb Cookie 一条都不会被带上。
     """
-    def __init__(self, secrets_root, *, tools_root=None):
+    def __init__(self, secrets_root, *, tools_root=None, policy_root=None, budget=None):
         from .scraping_access import SourceTransport
-        from .jav_cover_fetch import HostLimitedTransport
         self.secrets_root = Path(secrets_root)
+        self.policy_root = Path(policy_root) if policy_root is not None else None
         #: amane 桥的 venv 所在的工具区（`<Peach 数据目录>/tools`）；不给就用配置里的默认位置。
         self.tools_root = Path(tools_root) if tools_root is not None else None
-        self.transport = HostLimitedTransport(
-            SourceTransport(secrets_root, max_requests=MAX_SOURCE_REQUESTS,
+        self.transport = collection_log.CollectionTransport(
+            SourceTransport(secrets_root, policy_root=self.policy_root, budget=budget, max_requests=MAX_SOURCE_REQUESTS,
                             max_bytes=MAX_SOURCE_BYTES, max_seconds=MAX_SOURCE_SECONDS),
             2.0, limiter=SOURCE_LIMITER)
 
@@ -346,6 +346,11 @@ class LibraryMetadataProvider:
     #: 从单项动作预算里扣掉：一个站第一次弹验证窗口时，那一问要等 `min(40, timeout) + 120` 秒，
     #: 超过一部片 90 秒的资料预算，不扣掉的话这部片会被记成「预算内未取得」（ADR-0065 第二条）。
     excused = 0.0
+
+    def _source_policy(self):
+        from .collection_source_policy import read
+        return read(self.policy_root) if getattr(self, 'policy_root', None) is not None else {
+            'preferred_sources': [], 'disabled_sources': []}
 
     def _excuse(self, source, started):
         """`source` 是浏览器来源、这一问超过了 `BROWSER_REQUEST_TIMEOUT`：超出的那段按等人点验证算。"""
@@ -369,7 +374,8 @@ class LibraryMetadataProvider:
         key = (code, tuple(route))
         if key not in cache:
             sites = [site for site in route if site in metadata_amane.SITES]
-            open_sites = [site for site in sites if not paused_until(self.secrets_root, site)]
+            disabled = self._source_policy()['disabled_sources']
+            open_sites = [site for site in sites if site not in disabled and not paused_until(self.secrets_root, site)]
             if not sites:
                 cache[key] = NotFound('这个番号的链上没有经 amane 桥问的站')
             elif not open_sites:
@@ -385,7 +391,7 @@ class LibraryMetadataProvider:
         from . import metadata_amane, peach_proxy
         from .config import TOOLS_DIR
         from .jav_cover_fetch import Unavailable
-        from .scraping_access import SourcePaused, pause_source, values_for, record_source_check
+        from .scraping_access import SourcePaused, pause_source, values_for
         from .processing_control import checkpoint
         checkpoint('network')
         timeout = None
@@ -411,9 +417,11 @@ class LibraryMetadataProvider:
                     self.excused += elapsed
                 bridge = metadata_amane.AmaneBridge.create(tools)
             direct_sites = [site for site in sites if values_for(self.secrets_root, site).get('network') == 'direct']
-            report = bridge.query(code, sites, timeout=timeout,
-                                  proxy_options={'trust_env': False} if len(direct_sites) == len(sites)
-                                  else peach_proxy.client_options(self.secrets_root), direct_sites=direct_sites)
+            with collection_log.attempt('amane', '、'.join(SOURCE_LABELS.get(site, site) for site in sites),
+                                        'bridge'):
+                report = bridge.query(code, sites, timeout=timeout,
+                                      proxy_options={'trust_env': False} if len(direct_sites) == len(sites)
+                                      else peach_proxy.client_options(self.secrets_root), direct_sites=direct_sites)
         except Exception as error:  # noqa: BLE001 - 桥没装、venv 坏了、超时：整档未取得，原因给人看
             _raise_task_failure(error)
             return Unavailable(f'amane 桥：{str(error).strip() or describe_failure(error)}')
@@ -423,15 +431,7 @@ class LibraryMetadataProvider:
             'status': 'failed', 'reason': 'parse_error', 'detail': '桥未返回有效的来源记录',
         } for site in sites}
         found, failures = metadata_amane.split_report(code, {**report, 'sites': reports})
-        for site, result in reports.items():
-            error = failures.get(site)
-            record_source_check(self.secrets_root, site, 'metadata', {
-                'checked_at': time.time(), 'ok': result.get('status') == 'found' and error is None,
-                'kind': error.kind if error else 'ok',
-                'reason': error.detail if error else 'parsed',
-                'status': metadata_amane.diagnostic_status(result.get('http_status')),
-                'elapsed_s': result.get('elapsed_s', 0),
-            })
+        self._record_bridge_checks(reports, failures)
         problems, held = [], 0
         for site, error in failures.items():
             action = metadata_amane.cooldown_action(error)
@@ -448,6 +448,23 @@ class LibraryMetadataProvider:
         if held and held == len(problems):
             return SourcePaused('；'.join(problems))
         return Unavailable('；'.join(problems))
+
+    def _record_bridge_checks(self, reports, failures):
+        """桥的逐来源回执同时更新任务日志和来源连接诊断。"""
+        from . import metadata_amane
+        from .scraping_access import record_source_check
+        for site, result in reports.items():
+            error = failures.get(site)
+            collection_log.emit(site, SOURCE_LABELS.get(site, site), 'querying_metadata',
+                                'success' if error is None else 'not_found' if error.kind == 'not_found' else 'failed',
+                                reason=collection_log.redact(error.detail)[:1000] if error else '')
+            record_source_check(self.secrets_root, site, 'metadata', {
+                'checked_at': time.time(), 'ok': result.get('status') == 'found' and error is None,
+                'kind': error.kind if error else 'ok',
+                'reason': error.detail if error else 'parsed',
+                'status': metadata_amane.diagnostic_status(result.get('http_status')),
+                'elapsed_s': result.get('elapsed_s', 0),
+            })
 
     def community(self, code, *, deadline=None, route=None, known=(), absent=(), received=lambda found: None):
         """官方渠道落空时问综合索引那一档，返回 `[(来源, 资料)]`。
@@ -466,21 +483,32 @@ class LibraryMetadataProvider:
         have = dict(known)
         cache = self.__dict__.setdefault('_community', {})
         if code not in cache:
-            asked = [source for source in community_sources_for(code, route=route)
+            from .collection_source_policy import order
+            sources = order(community_sources_for(code, route=route),
+                            self._source_policy())
+            asked = [source for source in sources
                      if source not in have and source not in absent]
-            cache[code] = self._ask_community(code, asked, deadline, received)
+            cache[code] = self._ask_community(code, asked, deadline, received,
+                known=[(source, payload) for source, payload in have.items() if source in sources])
         if isinstance(cache[code], Exception):
             if have:
                 return list(have.items())
             raise _again(cache[code])
         return [*have.items(), *((source, payload) for source, payload in cache[code] if source not in have)]
 
-    def _ask_community(self, code, sources, deadline, received):
+    def _ask_community(self, code, sources, deadline, received, *, known=()):
         """逐家问 `sources`，交出答上的 `[(来源, 资料)]`，或一个待缓存再抛的异常（见 `community`）。"""
         from .jav_cover_fetch import Unavailable
         from .scraping_access import SourcePaused
         found, problems, said_no, held = [], [], [], 0
+        preferred = tuple(source for source in self._source_policy()['preferred_sources']
+                          if source in sources or source in dict(known))
         for source in sources:
+            answers = [*known, *found]
+            if (preferred and set(preferred) <= {name for name, _ in answers}
+                    and all(any(payload.get(field) for _, payload in answers)
+                            for field in metadata_routes.SCALAR_FIELDS)):
+                break
             try:
                 payload = self.site(source, code, deadline=deadline)
             except DeadlineExceeded:
@@ -551,8 +579,11 @@ class LibraryMetadataProvider:
             additions = []
             try:
                 session = Session(self.transport, _extended(deadline, self.excused - mark))
-                additions = [(name, record.payload())
-                             for record in SITE_SOURCES[name]().records(code, session=session)]
+                with collection_log.attempt(name, SOURCE_LABELS.get(name, name), 'querying_metadata') as result:
+                    additions = [(name, record.payload())
+                                 for record in SITE_SOURCES[name]().records(code, session=session)]
+                    if not additions:
+                        result['status'] = 'not_found'
                 state['found'] += additions
             except DeadlineExceeded:
                 # 前面已经答上时预算用尽只是「没再往下问」，不是这个番号没取到。
@@ -647,15 +678,16 @@ class LibraryMetadataProvider:
         写成一句。冷却、动作预算与连接失败由传输层抛出、原样放过。
         """
         from .sources import SITE_SOURCES, Session
-        return SITE_SOURCES[source]().query(code, session=Session(self.transport, deadline)).payload()
+        with collection_log.attempt(source, SOURCE_LABELS.get(source, source), 'querying_metadata'):
+            return SITE_SOURCES[source]().query(code, session=Session(self.transport, deadline)).payload()
 
     def query(self, code, source='r18dev', *, deadline=None):
         """有码与素人链上逐个成档的官方来源：默认是 r18.dev（`sources/r18dev.py`），有码链上它之后是 DMM 的
         GraphQL（`sources/dmm.py`，ADR-0059）。"""
         return self.site(source, code, deadline=deadline)
 
-    def cover(self, code, cover_root, *, deadline=None, evidence=(), snapshots=(), absent=()):
-        """官方大图优先；没有就用社区来源里两个图源对得上的那张；再没有就用官方小图。
+    def _choose_cover(self, code, *, deadline=None, evidence=(), snapshots=(), absent=()):
+        """按来源偏好取得并核验封面候选，同时保留未取得来源的原因。
 
         小图也比没有封面强（素人系官方图只有 300×300），但社区来源的大图只有被另一个
         图源印证过才用，官方小图本身也算一个图源（ADR-0030）。
@@ -673,37 +705,67 @@ class LibraryMetadataProvider:
         from .community_catalog import verified_cover
         from .jav_cover_fetch import SMALL_MIN_WIDTH, Unavailable, best_cover
         from .scraping_access import SourcePaused
-        target = cover_root / (code + '.jpg')
-        if cover_settled(target):
-            return False
-        kept = measure_image_file(target)
         mark = self.excused
         official, verified_by, problems, siblings = None, (), [], ()
-        try:
-            siblings = self._official_candidates(code, evidence, deadline=deadline, known=snapshots, absent=absent)
-            official = best_cover(self.transport, code, 0, deadline=_extended(deadline, self.excused - mark),
-                                  prior_candidates=siblings, minimum_width=SMALL_MIN_WIDTH,
-                                  known=_official_evidence(snapshots, absent))
-        except NotFound:
-            pass
-        except (Unavailable, SourcePaused) as error:
-            problems.append((describe_failure(error), source_paused(error)))
-        chosen = official
-        if official is None or official[1][0] < MIN_WIDTH:
+        chosen, answers = None, None
+        community_first = any(source in metadata_routes.COMMUNITY_STAGE
+                              for source in self._source_policy()['preferred_sources'])
+        if community_first:
             try:
                 answers = self.community(code, deadline=_extended(deadline, self.excused - mark), absent=absent,
+                                         route=metadata_routes.community_route(code, *evidence),
                                          known=[(name, payload) for name, payload in snapshots
                                                 if name in metadata_routes.COMMUNITY_STAGE])
                 *picked, verified_by = verified_cover(self.transport, code, answers,
-                                                      reference=official, siblings=siblings if official else (),
+                                                      reference=None, siblings=(),
                                                       deadline=_extended(deadline, self.excused - mark))
                 chosen = tuple(picked)
             except NotFound:
                 pass
             except (Unavailable, SourcePaused) as error:
                 problems.append((describe_failure(error), source_paused(error)))
+        if chosen is None or chosen[1][0] < MIN_WIDTH:
+            try:
+                siblings = self._official_candidates(code, evidence, deadline=deadline, known=snapshots, absent=absent)
+                official = best_cover(self.transport, code, 0, deadline=_extended(deadline, self.excused - mark),
+                                      prior_candidates=siblings, minimum_width=SMALL_MIN_WIDTH,
+                                      known=_official_evidence(snapshots, absent))
+            except NotFound:
+                pass
+            except (Unavailable, SourcePaused) as error:
+                problems.append((describe_failure(error), source_paused(error)))
+            if official is not None and (chosen is None or
+                    official[1][0] * official[1][1] >= chosen[1][0] * chosen[1][1]):
+                chosen = official
+                verified_by = ()
+            if official is None or official[1][0] < MIN_WIDTH:
+                try:
+                    if answers is None:
+                        answers = self.community(code, deadline=_extended(deadline, self.excused - mark), absent=absent,
+                                                 known=[(name, payload) for name, payload in snapshots
+                                                        if name in metadata_routes.COMMUNITY_STAGE])
+                    *picked, confirmed_by = verified_cover(self.transport, code, answers,
+                                                          reference=official, siblings=siblings if official else (),
+                                                          deadline=_extended(deadline, self.excused - mark))
+                    if chosen is None or picked[1][0] * picked[1][1] >= chosen[1][0] * chosen[1][1]:
+                        chosen = tuple(picked)
+                        verified_by = confirmed_by
+                except NotFound:
+                    pass
+                except (Unavailable, SourcePaused) as error:
+                    problems.append((describe_failure(error), source_paused(error)))
         if chosen is None:
             raise _unreached(problems) if problems else NotFound('官方与社区来源都没有这部片的封面')
+        return chosen, official, verified_by, problems
+
+    def cover(self, code, cover_root, *, deadline=None, evidence=(), snapshots=(), absent=()):
+        """只在来源和质量检查通过时原子安装封面，未提高质量时保留本机图片。"""
+        target = cover_root / (code + '.jpg')
+        if cover_settled(target):
+            return False
+        kept = measure_image_file(target)
+        chosen, official, verified_by, problems = self._choose_cover(code,
+            deadline=deadline, evidence=evidence, snapshots=snapshots, absent=absent)
         candidate, size, data = chosen
         # 官方图可替换社区转存图；同类来源按像素面积升级。
         from .community_catalog import origin_of
@@ -727,6 +789,8 @@ class LibraryMetadataProvider:
         install_cover(target, code, data, size, evidence=dict(source=candidate.source, title=title,
             source_url=candidate.url, width=size[0], height=size[1], verified_by=list(verified_by),
             raw_sha256=hashlib.sha256(data).hexdigest(), checked_at=time.time()))
+        collection_log.emit(candidate.source, candidate.source, 'fetching_cover', 'success',
+                            width=size[0], height=size[1])
         return True
 
     def reset(self):
@@ -1451,6 +1515,7 @@ class _RemoteSession:
         self._config = config
         self._factory = provider_factory
         self._provider = None
+        self._budget = None
         self.misses = misses
         #: 用户对每种内容类型的来源链覆盖，形状见 `metadata_routes.parse_route_overrides`。
         self._routes = routes or None
@@ -1463,8 +1528,23 @@ class _RemoteSession:
         if self._provider is None:
             self._provider = (self._factory() if self._factory
                               else LibraryMetadataProvider(self._config.directory('secrets'),
-                                                           tools_root=self._config.directory('tools')))
+                                  tools_root=self._config.directory('tools'),
+                                  policy_root=self._config.directory('state'), budget=self._budget))
         return self._provider
+
+    def fork(self):
+        """每个工作线程独立连接和单片缓存；共享来源间隔、总预算及无结果记忆。"""
+        from .collection_concurrency import on_owner
+        owner = self
+        class Misses:
+            def fresh(self, *args):
+                return on_owner(owner.misses.fresh, *args)
+            def record(self, *args):
+                return on_owner(owner.misses.record, *args)
+        remote = _RemoteSession(self._config, self._factory, Misses(),
+                                retrying=not self._consult, routes=self._routes)
+        remote._budget = self._budget
+        return remote
 
     def reset(self):
         if self._provider is not None and hasattr(self._provider, 'reset'):
@@ -1618,7 +1698,9 @@ class _RemoteSession:
 
     def _chain(self, code, *evidence):
         from .custom_metadata import source_key
+        from .collection_source_policy import order, read
         chain = metadata_routes.route_for_code(code, *evidence, overrides=self._routes)
+        chain = order(chain, read(self._config.directory('state')))
         return (*chain, *(source_key(entry) for entry in self._custom_sources(code, *evidence)))
 
     def _ask(self, source, code, members, cached, *, required, deadline, evidence, received=lambda found: None):
@@ -1689,6 +1771,8 @@ class _RemoteSession:
             attempted.update(members)
             cached = self._cached_evidence(members, code)
             if cached:
+                for name, *_ in cached:
+                    collection_log.emit(name, SOURCE_LABELS.get(name, name), action, 'cached')
                 results.cached(cached)
                 if metadata_routes.settles(required, _given_fields(entries),
                                            wants_tags=wants_tags, then=then):
@@ -1699,9 +1783,14 @@ class _RemoteSession:
             try:
                 # 浏览器来源等人点验证的那段不算进这部片的预算（`LibraryMetadataProvider.excused`）。
                 update(current_source={'key': source, 'label': PROVIDER_NAMES.get(source, source)})
-                found = self._ask(source, code, members, cached, required=required, evidence=evidence,
-                                  deadline=_extended(deadline, _excused(self._provider) - mark),
-                                  received=results.save)
+                with collection_log.attempt(source, '、'.join(SOURCE_LABELS.get(name, name) for name in members),
+                                            action) as result:
+                    found = self._ask(source, code, members, cached, required=required, evidence=evidence,
+                                      deadline=_extended(deadline, _excused(self._provider) - mark),
+                                      received=results.save)
+                    result['sources'] = list(dict.fromkeys(name for name, _ in found))
+                    if not found:
+                        result['status'] = 'not_found'
             except DeadlineExceeded:
                 self.reset()
                 if entries:
@@ -1749,9 +1838,11 @@ class _RemoteSession:
             return []
         cached = self._cached_evidence((source,), code)
         if cached:
+            collection_log.emit(source, SOURCE_LABELS.get(source, source), 'querying_metadata', 'cached')
             return cached
         try:
-            payload = self.provider().query(code, source, deadline=deadline)
+            with collection_log.attempt(source, SOURCE_LABELS.get(source, source), 'querying_metadata'):
+                payload = self.provider().query(code, source, deadline=deadline)
         except Exception as error:
             _raise_task_failure(error)
             if isinstance(error, DeadlineExceeded):
@@ -1770,7 +1861,7 @@ class _RemoteSession:
     def _cover(self, row, code, cover_root, *, update, issue, snapshots=(), absent=()):
         action = 'fetching_cover'
         # 「封面没有」是这条链上各站合起来的答复：链上有一站是记下之后才接入的，就再问一遍。
-        lineup = metadata_routes.route_for_code(code, *_studio_evidence(row), overrides=self._routes)
+        lineup = self._chain(code, *_studio_evidence(row))
         if self._fresh_miss('cover', code, lineup):
             # 已经有一张小图的不算问题项：卡片上有封面，只是还没换到更大的。
             if measure_image_file(cover_root / (code + '.jpg')) is None:
@@ -1780,9 +1871,17 @@ class _RemoteSession:
         update(stage='采集缺失封面', current_action=action,
                current_started_at=time.time(), current_deadline_at=time.time() + budget, current_source=None)
         try:
-            return int(self.provider().cover(code, cover_root, deadline=deadline_after(budget),
-                                             evidence=_studio_evidence(row), snapshots=snapshots,
-                                             absent=absent))
+            with collection_log.attempt('cover', '封面来源', action) as result:
+                try:
+                    covers = int(self.provider().cover(code, cover_root, deadline=deadline_after(budget),
+                                                       evidence=_studio_evidence(row), snapshots=snapshots,
+                                                       absent=absent))
+                except CoverKept:
+                    result['status'] = 'kept'
+                    raise
+                if not covers:
+                    result['status'] = 'kept'
+                return covers
         except DeadlineExceeded:
             self.reset()
             issue(row, '封面在预算时间内未取得，可稍后重试', action=action, retryable=True)
@@ -2094,7 +2193,8 @@ def _collect_allowed(remote, traffic, row, code, missing, allowed, cover_root, c
     if allowed & {'metadata', 'cover'}:
         traffic.start_metadata(code)
         try:
-            with processing_item(row['id']):
+            with (processing_item(row['id']), collection_log.bind(
+                    lambda event: update(collection_event=dict(asset_id=row['id'], code=code, **event)))):
                 found, covers = remote.collect(row, code, missing if 'metadata' in allowed else [], cover_root,
                                                update=update, issue=issue, answered=answered, received=received,
                                                fetch_cover='cover' in allowed)
@@ -2576,7 +2676,8 @@ def _restore_processing_counts(state, previous):
     """同一处理任务沿用累计数、问题清单和已保存证据索引。"""
     previous = previous or {}
     for key in ('started_at', 'identified', 'covers', 'previews', 'probed', 'issue_count', 'paused_count',
-                'issue_preview', 'issues_truncated', 'notes', 'retryable_asset_ids', 'junk_isolated', 'junk_review'):
+                'issue_preview', 'issues_truncated', 'notes', 'retryable_asset_ids', 'junk_isolated', 'junk_review',
+                'collection_preview'):
         if key in previous:
             state[key] = previous[key]
     for key in ('scan_checkpoints', 'local_metadata'):
@@ -2754,6 +2855,8 @@ def process_library(config, db_path, candidate_root, cover_root, *, location='co
         # 界面只展示前 20 条，完整清单在这个文件里；地址跟着状态一起给出，
         # 不让人按 job_id 自己去拼路径。
         state['issues_log'] = str(log_path)
+        collection = collection_log.CollectionLog(log_path.with_name(
+            log_path.name.removesuffix('.issues.jsonl') + '.collection.jsonl'), state, resume=bool(resume_state))
 
         flush_state = _ProcessingStateFile(path, state)
 
@@ -2761,6 +2864,13 @@ def process_library(config, db_path, candidate_root, cover_root, *, location='co
             _require_writer(config, db_path)
             if not active():
                 raise InterruptedError('处理任务已停止')
+            if event := values.pop('collection_event', None):
+                values['current_source'] = event.pop('active_source')
+                event['phase'] = state.get('current_action', '')
+                try:
+                    values['collection_preview'] = collection.record(event)
+                except OSError as error:
+                    raise _ProcessingPersistenceError(f'采集日志无法保存：{error}') from error
             checkpoint_values(values)
             state.update(values)
             estimate.update(state)
@@ -2934,30 +3044,16 @@ def process_library(config, db_path, candidate_root, cover_root, *, location='co
                                                      | blocked)
                 prepared = [entry for entry in prepared if entry[0]['id'] not in blocked]
                 update(current_action='', current_started_at=None, current_deadline_at=None)
-            for position, (row, code, verify_existing, local_fields, local_entries, local_ok) in enumerate(prepared):
-                local_ok = local_ok and row['id'] not in poster_failed
-                guard.check()
-                issues_before = state['issue_count']
-                update(stage='采集缺失资料', checked=completed_count + position,
-                       total=completed_count + len(prepared), current_asset_id=row['id'],
-                       current_asset_name=Path(str(row['name'] or '')).name)
-                target_key = f"asset:{row['id']}"
-                missing = list(COLLECTED_FIELDS) if verify_existing else _missing_fields(row, local_fields)
-                found, covers = _collect_allowed(
-                    remote, traffic, row, code, missing, stages_of(row['path']), cover_root, covered,
-                    update=update, issue=issue,
-                    answered=() if verify_existing else _answered_sources(groups, target_key, missing),
-                    received=lambda entries, row=row, code=code, fields=local_fields, verify=verify_existing:
-                        publish(row, code, fields, verify, entries),
-                    succeeded=lambda before=issues_before: state['issue_count'] == before)
-                state['covers'] += covers
-                update(stage='保存待确认资料', current_action='writing_candidates',
-                       current_started_at=time.time(), current_deadline_at=None)
-                checkpoints.queue_metadata(row, local_entries + found if local_ok else [], issues_before)
-                flush_candidates()
-                update(checked=completed_count + position + 1, candidates=len(scoped_groups()),
-                       current_asset_id=None, current_asset_name='', current_action='',
-                       current_started_at=None, current_deadline_at=None)
+            from .library_collection import collect
+            from .collection_source_policy import read as read_collection_policy
+            from .collection_concurrency import worker_count
+            concurrency = worker_count(read_collection_policy(config.directory('state'))['concurrency'])
+            update(collection_concurrency=concurrency)
+            collect(prepared, remote, traffic, cover_root, covered, state=state,
+                completed_count=completed_count, stages_of=stages_of, guard=guard,
+                update=update, issue=issue, publish=publish, groups=groups, poster_failed=poster_failed,
+                checkpoints=checkpoints, flush_candidates=flush_candidates, scoped_groups=scoped_groups,
+                concurrency=concurrency)
             flush_candidates(force=True)
             update(estimate_pending={}, stage='整理采集结果', checked=0, total=0)
             # 候选完整落盘后立即执行调用方注入的窄规则，不再等人打开复核页才触发。

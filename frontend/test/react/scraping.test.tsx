@@ -12,7 +12,7 @@ import { prefetchScraping } from '../../src/react/scraping/scraping';
 import type { AmaneBridge, Check, CoverJob, Source } from '../../src/react/scraping/scraping';
 
 import {
-  buttonNamed, click, mount, mountRoot, section, settle, submit, type,
+  buttonNamed, choose, click, mount, mountRoot, section, settle, submit, type,
 } from './render';
 
 // 客户端是模块级的单例（所有 React 根共用一个），用例之间不清就互相喂数据。
@@ -121,6 +121,100 @@ it('首屏用 prefetch 缓存画出来源与任务，挂载时不重复请求', 
   expect(host.querySelector<HTMLAnchorElement>('a[href="/settings/library#peachProxy"]')?.textContent)
     .toContain('配置 Peach 代理');
   expect(host.querySelector<HTMLAnchorElement>('a[href="https://www.javbus.com/"]')?.target).toBe('_blank');
+});
+
+const collectionPolicy = {
+  preferred_sources: [], disabled_sources: [], concurrency: null, default_concurrency: 6, sources: [
+    { source: 'javbus', label: 'JavBus', can_prefer: true },
+    { source: 'javdb', label: 'JavDB', can_prefer: true },
+    { source: 'dmm', label: 'DMM', can_prefer: true },
+    { source: 'r18dev', label: 'r18.dev', can_prefer: true },
+  ],
+};
+
+it('采集设置保存来源偏好与并发数，保留凭证卡片', async () => {
+  const { calls, host, toast } = await open({
+    ...quiet({ cookie_saved: true }),
+    'GET /api/scraping': () => ({ body: { sources: [source({ cookie_saved: true })], collection_policy: collectionPolicy } }),
+    'POST /api/scraping/settings': (body: { collection_policy: unknown }) => ({ body }),
+  });
+  const card = section(host, '馆藏采集来源')!;
+  await click(buttonNamed('优先 JavBus 和 JavDB', card));
+  expect([...card.querySelectorAll('[data-source-order]')].map((row) => row.getAttribute('data-source-order')))
+    .toEqual(['javbus', 'javdb']);
+  const dmm = card.querySelector<HTMLInputElement>('input[type=checkbox]')!;
+  await click(dmm);
+  await click(buttonNamed('保存采集来源', card));
+  await settle();
+  expect(calls.at(-1)?.body).toEqual({ collection_policy: {
+    preferred_sources: ['javbus', 'javdb'], disabled_sources: ['dmm'], concurrency: null,
+  } });
+  expect(buttonNamed('撤销 Cookie', section(host, 'JavBus')!)).not.toBeNull();
+  expect(toast).toHaveBeenCalledWith('采集设置已保存');
+});
+
+it('来源偏好允许四家优先来源并提交完整顺序', async () => {
+  const { calls, host } = await open({
+    ...quiet(),
+    'GET /api/scraping': () => ({ body: { sources: [source()], collection_policy: collectionPolicy } }),
+    'POST /api/scraping/settings': (body: { collection_policy: unknown }) => ({ body }),
+  });
+  const card = section(host, '馆藏采集来源')!;
+  await click(buttonNamed('优先 JavBus 和 JavDB', card));
+  for (const label of ['DMM', 'r18.dev']) {
+    const row = [...card.querySelectorAll('li')].find((item) => item.textContent?.includes(label))!;
+    await click(buttonNamed('设为优先', row));
+  }
+  expect([...card.querySelectorAll('[data-source-order]')].map((row) => row.getAttribute('data-source-order')))
+    .toEqual(['javbus', 'javdb', 'dmm', 'r18dev']);
+  await click(buttonNamed('保存采集来源', card));
+  await settle();
+  expect(calls.at(-1)?.body).toEqual({ collection_policy: {
+    preferred_sources: ['javbus', 'javdb', 'dmm', 'r18dev'], disabled_sources: [], concurrency: null,
+  } });
+});
+
+it('并发数可从 CPU 自动值切换到自定义，并拒绝无效草稿', async () => {
+  const { calls, host } = await open({
+    ...quiet(),
+    'GET /api/scraping': () => ({ body: { sources: [source()], collection_policy: collectionPolicy } }),
+    'POST /api/scraping/settings': (body: { collection_policy: unknown }) => ({ body }),
+  });
+  const card = section(host, '馆藏采集来源')!;
+  const mode = () => card.querySelector('[aria-haspopup=listbox]');
+  expect(mode()?.textContent).toContain('CPU 逻辑核心数：6');
+  await choose(mode(), '自定义');
+  const count = card.querySelector<HTMLInputElement>('input[type=number]')!;
+  await type(count, '0');
+  expect(buttonNamed('保存采集来源', card)?.disabled).toBe(true);
+  await type(count, '9');
+  await click(buttonNamed('保存采集来源', card));
+  await settle();
+  expect(calls.at(-1)?.body).toEqual({ collection_policy: {
+    preferred_sources: [], disabled_sources: [], concurrency: 9,
+  } });
+  await choose(mode(), '自动（CPU 逻辑核心数：6）');
+  expect(card.querySelector('input[type=number]')).toBeNull();
+  await click(buttonNamed('保存采集来源', card));
+  await settle();
+  expect(calls.at(-1)?.body).toEqual({ collection_policy: {
+    preferred_sources: [], disabled_sources: [], concurrency: null,
+  } });
+});
+
+it('来源偏好保存失败时保留草稿并显示原因', async () => {
+  const { host, toast } = await open({
+    ...quiet(),
+    'GET /api/scraping': () => ({ body: { sources: [source()], collection_policy: collectionPolicy } }),
+    'POST /api/scraping/settings': () => ({ ok: false, status: 400, body: { message: '设置未能写入' } }),
+  });
+  const card = section(host, '馆藏采集来源')!;
+  await click(buttonNamed('优先 JavBus 和 JavDB', card));
+  await click(buttonNamed('保存采集来源', card));
+  await settle();
+  expect(card.querySelector('[role=alert]')?.textContent).toContain('设置未能写入');
+  expect(card.querySelectorAll('[data-source-order]')).toHaveLength(2);
+  expect(toast).not.toHaveBeenCalled();
 });
 
 it('走本机浏览器的来源只说明验证怎么过，不画 Cookie 输入', async () => {

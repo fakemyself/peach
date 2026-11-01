@@ -1,5 +1,7 @@
 """按内容类型的来源链：判哪种内容、问哪几家、什么顺序、何时停。"""
 import unittest
+import tempfile
+from pathlib import Path
 
 from peach.metadata_policy import SOURCE_SPECS
 from peach.metadata_routes import (AMANE_OFFICIAL_STAGE, AMANE_STAGE, COMMUNITY_STAGE, CONTENT_TYPES,
@@ -13,6 +15,62 @@ def amane_sites(code, *hints, overrides=None):
     """这个番号在经桥的两档各问哪几站：(官方档, 转载站那一档)。"""
     chain = route_for_code(code, *hints, overrides=overrides)
     return stage_members('amane_official', chain), stage_members('amane', chain)
+
+
+class CollectionSourcePolicyTests(unittest.TestCase):
+    def test_preferences_reorder_only_applicable_sources_and_can_be_restored(self):
+        """偏好不扩大内容范围，保存和恢复均作用于本机设置。"""
+        from peach.collection_source_policy import order, read, save
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            policy = save(root, {'preferred_sources': ['javbus', 'javdb'], 'disabled_sources': ['dmm']})
+            self.assertEqual(read(root), policy)
+            self.assertEqual(order(('r18dev','dmm','avbase','javbus','javdb'), policy),
+                             ('javbus','javdb','r18dev','avbase'))
+            self.assertEqual(order(route_for_code('FC2-PPV-1234567'), policy)[0], 'javdb')
+            self.assertNotIn('javbus', order(route_for_code('FC2-PPV-1234567'), policy))
+            self.assertEqual(order((), policy), ())
+            self.assertEqual(save(root, {}), {'preferred_sources': [], 'disabled_sources': [], 'concurrency': None})
+
+    def test_invalid_preferences_preserve_the_saved_policy(self):
+        """未知来源、停用优先来源和错误数据类型均不覆盖已保存设置。"""
+        from peach.collection_source_policy import read, save
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            previous = save(root, {'preferred_sources': ['javbus','javdb']})
+            for policy in ({'preferred_sources': 'javbus'}, {'disabled_sources': ['unknown']},
+                           {'preferred_sources': ['javdb'], 'disabled_sources': ['javdb']},
+                           {'preferred_sources': ['unknown']},
+                           *({'concurrency': value} for value in (0, -1, True, 1.5, '4'))):
+                with self.subTest(policy=policy), self.assertRaises(ValueError):
+                    save(root, policy)
+                self.assertEqual(read(root), previous)
+
+    def test_every_collection_source_can_be_preferred_without_expanding_its_route(self):
+        """全部馆藏来源可排序，作品仍只查询自身类型的适用来源。"""
+        from peach.collection_source_policy import AVAILABLE, order, read, save
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            preferred = list(reversed(AVAILABLE))
+            self.assertGreater(len(preferred), 3)
+            policy = save(root, {'preferred_sources': preferred})
+            self.assertEqual(read(root)['preferred_sources'], preferred)
+            for code in ('IPX-001', '300MIUM-1239', 'FC2-PPV-1234567'):
+                with self.subTest(code=code):
+                    applicable = route_for_code(code)
+                    self.assertEqual(order(applicable, policy),
+                                     tuple(source for source in preferred if source in applicable))
+            self.assertEqual(order((), policy), ())
+
+    def test_worker_preference_is_persisted_and_automatic_can_be_restored(self):
+        """自定义并发数与来源偏好共同保存，自动值保留为空。"""
+        from peach.collection_source_policy import read, save
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            self.assertIsNone(read(root)['concurrency'])
+            save(root, {'preferred_sources': ['dmm'], 'concurrency': 7})
+            self.assertEqual(read(root)['concurrency'], 7)
+            self.assertIsNone(save(root, {'concurrency': None})['concurrency'])
 
 
 class ClassifyTests(unittest.TestCase):
